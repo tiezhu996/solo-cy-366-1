@@ -39,7 +39,7 @@ func Connect(cfg *config.Config) (*gorm.DB, error) {
 
 // migrate 自动建表。
 func migrate(db *gorm.DB) error {
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&model.User{},
 		&model.Station{},
 		&model.TimePackage{},
@@ -53,7 +53,22 @@ func migrate(db *gorm.DB) error {
 		&model.Registration{},
 		&model.Match{},
 		&model.AuditLog{},
-	)
+		&model.RepairRecord{},
+	); err != nil {
+		return err
+	}
+	// 同一机位仅允许一条待处理报修：open_station_id 为生成列，
+	// status=pending 时等于 station_id，否则为 NULL（MySQL 唯一索引允许重复 NULL）。
+	if db.Migrator().HasTable(&model.RepairRecord{}) && !db.Migrator().HasIndex(&model.RepairRecord{}, "uk_repair_open_station") {
+		if err := db.Exec(`
+ALTER TABLE repair_records
+  ADD COLUMN open_station_id BIGINT UNSIGNED GENERATED ALWAYS AS
+    (CASE WHEN status = 'pending' THEN station_id ELSE NULL END) VIRTUAL,
+  ADD UNIQUE KEY uk_repair_open_station (open_station_id)`).Error; err != nil {
+			return fmt.Errorf("repair open unique index: %w", err)
+		}
+	}
+	return nil
 }
 
 // Seed 初始化种子数据（管理员、示例机位、时长包）。

@@ -136,3 +136,19 @@ export const STATION_TYPE_TEXT: Record<string, string> = {
 }
 
 export const AREA_OPTIONS = ['A区', 'B区', '包厢区']
+
+// 报修记录状态（与后端 internal/constants/repair.go 对应）
+export const REPAIR_STATUS = {
+  PENDING: 'pending',
+  CLOSED: 'closed',
+} as const
+
+export const REPAIR_STATUS_TEXT: Record<string, string> = {
+  pending: '待处理',
+  closed: '已关闭',
+}
+
+export const REPAIR_STATUS_TYPE: Record<string, string> = {
+  pending: 'danger',
+  closed: 'success',
+}

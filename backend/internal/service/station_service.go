@@ -17,12 +17,13 @@ import (
 // StationService 机位服务。
 type StationService struct {
 	stationRepo *repository.StationRepository
+	repairRepo  *repository.RepairRepository
 	logger      *slog.Logger
 }
 
 // NewStationService 构造机位服务。
-func NewStationService(stationRepo *repository.StationRepository, logger *slog.Logger) *StationService {
-	return &StationService{stationRepo: stationRepo, logger: logger}
+func NewStationService(stationRepo *repository.StationRepository, repairRepo *repository.RepairRepository, logger *slog.Logger) *StationService {
+	return &StationService{stationRepo: stationRepo, repairRepo: repairRepo, logger: logger}
 }
 
 // Create 创建机位。
@@ -74,7 +75,9 @@ func (s *StationService) Update(id uint, req *dto.UpdateStationReq) (*model.Stat
 }
 
 // UpdateStatus 机位状态流转：idle<->using/reserved/fault。
-func (s *StationService) UpdateStatus(id uint, req *dto.UpdateStationStatusReq) (*model.Station, error) {
+// 故障登记（->fault）与故障恢复（fault->idle）属于报修闭环，必须分别经
+// RepairService.Report / RepairService.Close 填写原因与处理结果，此处直接拒绝。
+func (s *StationService) UpdateStatus(id uint, req *dto.UpdateStationStatusReq, operator string) (*model.Station, error) {
 	station, err := s.stationRepo.FindByID(id)
 	if err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
@@ -83,6 +86,14 @@ func (s *StationService) UpdateStatus(id uint, req *dto.UpdateStationStatusReq) 
 		return nil, fmt.Errorf("station status find: %w", err)
 	}
 	from := station.Status
+	if from == constants.StationFault && req.Status == constants.StationIdle {
+		return nil, util.NewAppError(constants.CodeRepairNone,
+			"故障机位恢复空闲必须填写处理结果并关闭报修，请使用报修恢复操作（实体：repair_record，字段：handle_result）")
+	}
+	if req.Status == constants.StationFault {
+		return nil, util.NewAppError(constants.CodeRepairOpen,
+			"标记故障必须填写报修原因，请使用报修登记操作（实体：repair_record，字段：reason）")
+	}
 	if !allowedStationTransition(from, req.Status) {
 		return nil, util.NewAppError(constants.CodeConflict,
 			fmt.Sprintf("机位状态不允许从 %s 变更为 %s，请先处理当前状态", util.StatusText(from), util.StatusText(req.Status)))
@@ -91,7 +102,7 @@ func (s *StationService) UpdateStatus(id uint, req *dto.UpdateStationStatusReq) 
 	if err := s.stationRepo.Update(station); err != nil {
 		return nil, fmt.Errorf("station status update: %w", err)
 	}
-	s.logger.Info(fmt.Sprintf(constants.LogTemplates["station_status_change"], station.ID, from, req.Status, "operator"))
+	s.logger.Info(fmt.Sprintf(constants.LogTemplates["station_status_change"], station.ID, from, req.Status, operator))
 	return station, nil
 }
 
@@ -106,6 +117,13 @@ func (s *StationService) Delete(id uint) error {
 	}
 	if station.Status == constants.StationUsing {
 		return util.NewAppError(constants.CodeStationBusy, "使用中的机位不能删除，请先下机")
+	}
+	open, err := s.repairRepo.FindOpenByStation(id)
+	if err != nil {
+		return fmt.Errorf("station delete find open repair: %w", err)
+	}
+	if open != nil {
+		return util.NewAppError(constants.CodeRepairOpen, "该机位存在待处理报修，请先处理并恢复空闲后再删除")
 	}
 	if err := s.stationRepo.Delete(id); err != nil {
 		return fmt.Errorf("station delete: %w", err)

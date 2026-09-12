@@ -50,6 +50,17 @@ func StatusText(status string) string {
 	return status
 }
 
+// RepairStatusText 将报修状态枚举转为中文展示文本。
+func RepairStatusText(status string) string {
+	switch status {
+	case "pending":
+		return "待处理"
+	case "closed":
+		return "已关闭"
+	}
+	return status
+}
+
 // RoleText 将角色枚举转为中文。
 func RoleText(role string) string {
 	switch role {

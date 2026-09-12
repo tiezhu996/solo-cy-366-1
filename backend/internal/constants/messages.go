@@ -17,6 +17,18 @@ const (
 	MsgRenewOK      = "续费成功"
 	MsgCheckoutOK   = "下机成功"
 	MsgDrawOK       = "抽签分组完成"
+
+	MsgRepairCreateOK = "报修登记成功"
+	MsgRepairCloseOK  = "报修已关闭，机位恢复空闲"
+)
+
+// 报修相关错误提示文案（message 中带实体名/字段名/角色名，service/handler 层层包装）。
+const (
+	MsgRepairReasonRequired = "报修原因不能为空（实体：repair_record，字段：reason）"
+	MsgRepairResultRequired = "处理结果不能为空（实体：repair_record，字段：handle_result）"
+	MsgRepairStationFault   = "仅故障机位可以登记报修（实体：station，字段：status）"
+	MsgRepairToIdleOnly     = "存在待处理报修时，机位仅允许恢复为空闲（实体：station，字段：status）"
+	MsgRepairRoleReject     = "当前角色无权操作报修闭环（实体：repair_record，允许角色：管理员/店员）"
 )
 
 // 日志文案模板（非格式化部分）。

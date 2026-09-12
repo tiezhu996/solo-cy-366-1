@@ -31,6 +31,7 @@ const authStore = useAuthStore()
 const titles: Record<string, string> = {
   dashboard: '运营看板',
   stations: '机位管理',
+  repairs: '报修记录',
   recharge: '充值与时长包',
   reservations: '机位预约',
   sessions: '上机记录与排行榜',

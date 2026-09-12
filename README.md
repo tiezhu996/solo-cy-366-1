@@ -130,8 +130,21 @@ docker compose up -d --build
 | GET | /stations/:id | 机位详情 | 登录 |
 | POST | /stations | 创建机位 | admin/staff |
 | PUT | /stations/:id | 更新机位 | admin/staff |
-| PUT | /stations/:id/status | 机位状态流转 | admin/staff |
+| PUT | /stations/:id/status | 机位状态流转（故障/恢复须走报修接口） | admin/staff |
 | DELETE | /stations/:id | 删除机位 | admin |
+
+### 机位报修闭环
+
+| 方法 | 路径 | 说明 | 权限 |
+| --- | --- | --- | --- |
+| POST | /stations/:id/repair-report | 标记故障并登记报修（reason 必填），机位置为故障 | admin/staff |
+| POST | /stations/:id/repair-close | 恢复空闲并关闭报修（handle_result 必填） | admin/staff |
+| GET | /stations/:id/repairs | 该机位报修历史（原因/结果/角色/时间） | 登录 |
+| GET | /stations/:id/detail | 机位详情（机位 + 当前待处理报修 + 报修历史） | 登录 |
+| GET | /repairs | 报修记录分页（station_id/status 筛选） | admin/staff |
+| GET | /repairs/:id | 报修记录详情 | 登录 |
+
+> 报修闭环规则：标记故障必须填写原因并生成 `pending` 报修记录；恢复空闲必须填写处理结果并关闭对应记录；同一机位同时仅允许一条待处理报修（数据库生成列唯一索引 + 事务行锁双重保证）；普通会员调用登记/关闭/列表接口返回 403。
 
 ### 充值与时长包
 
@@ -221,6 +234,19 @@ curl -sS -X POST http://localhost:29506/api/v1/recharges/packages \
 
 # 6. 上机时长排行榜
 curl -sS "http://localhost:29506/api/v1/sessions/rank?period=week&limit=10" -H "Authorization: Bearer $TOKEN"
+
+# 7. 机位报修闭环（管理员/店员）
+# 7.1 标记故障并登记报修（原因必填，生成待处理报修记录）
+curl -sS -X POST http://localhost:29506/api/v1/stations/1/repair-report \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"reason":"键盘失灵，鼠标断连"}'
+# 7.2 机位详情：原因/结果/操作角色/时间
+curl -sS http://localhost:29506/api/v1/stations/1/detail -H "Authorization: Bearer $TOKEN"
+# 7.3 恢复空闲并关闭报修（处理结果必填）
+curl -sS -X POST http://localhost:29506/api/v1/stations/1/repair-close \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"handle_result":"已更换键鼠并测试通过"}'
+# 7.4 同一机位重复登记返回 409 / code=40010；会员调用返回 403
 ```
 
 ## 本地开发方式
@@ -303,6 +329,13 @@ npm run build
 | --- | --- |
 | 后端 | `backend/internal/constants/enums.go`、`backend/internal/dto/session_dto.go`（oneof）、`backend/internal/dto/tournament_dto.go`（oneof）、`backend/internal/model/session.go`、`backend/internal/service/session_service.go`（defaultGameType）、`backend/internal/util/formatters.go`（GameTypeText） |
 | 前端 | `frontend/src/constants/index.ts`（GAME_TYPE/TEXT、PAYMENT_METHOD/TEXT）、`frontend/src/pages/Sessions.vue`、`frontend/src/pages/Recharge.vue`、`frontend/src/pages/Tournaments.vue` |
+
+### 报修状态（pending / closed）
+
+| 端 | 文件 |
+| --- | --- |
+| 后端 | `backend/internal/constants/repair.go`（定义/校验）、`backend/internal/model/repair_record.go`（模型默认值）、`backend/internal/dto/repair_dto.go`（oneof/必填校验）、`backend/internal/dto/station_dto.go`（reason/handle_result 必填联动）、`backend/internal/service/repair_service.go`（登记/关闭状态机）、`backend/internal/service/station_service.go`（旁路状态流转拒绝）、`backend/internal/repository/repair_repository.go`（待处理查询/行锁/筛选）、`backend/internal/repository/common.go`（唯一键冲突兜底）、`backend/internal/util/formatters.go`（RepairStatusText）、`backend/internal/constants/error_codes.go`（CodeRepairOpen/CodeRepairNone）、`backend/internal/constants/log_templates.go`（repair_* 模板）、`backend/internal/constants/messages.go`（报修文案）、`backend/internal/handler/helpers.go`（错误码映射 409）、`backend/internal/database/database.go`（生成列唯一索引 uk_repair_open_station）、`backend/migrations/001_init.sql`（repair_records 建表） |
+| 前端 | `frontend/src/constants/index.ts`（REPAIR_STATUS/TEXT/TYPE）、`frontend/src/api/repair.ts`、`frontend/src/stores/stationStore.ts`（reportFault/recoverIdle）、`frontend/src/components/StatusBadge.vue`（repair 徽标）、`frontend/src/pages/Stations.vue`（登记/恢复表单与详情展示）、`frontend/src/pages/Repairs.vue`（报修记录列表） |
 
 ## 设计说明
 

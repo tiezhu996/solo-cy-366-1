@@ -55,11 +55,12 @@ func main() {
 	regRepo := repository.NewRegistrationRepository(db)
 	matchRepo := repository.NewMatchRepository(db)
 	auditRepo := repository.NewAuditRepository(db)
+	repairRepo := repository.NewRepairRepository(db)
 
 	// 服务层
 	authService := service.NewAuthService(userRepo, logger, cfg.JWTSecret, cfg.JWTExpireSec)
 	userService := service.NewUserService(userRepo, logger)
-	stationService := service.NewStationService(stationRepo, logger)
+	stationService := service.NewStationService(stationRepo, repairRepo, logger)
 	packageService := service.NewTimePackageService(packageRepo, logger)
 	rechargeService := service.NewRechargeService(userRepo, rechargeRepo, packageRepo, userPkgRepo, orderRepo, logger)
 	reservationService := service.NewReservationService(reservationRepo, stationService, db, logger)
@@ -67,6 +68,7 @@ func main() {
 	tournamentService := service.NewTournamentService(tournamentRepo, teamRepo, regRepo, matchRepo, db, logger)
 	auditService := service.NewAuditService(auditRepo, logger)
 	dashboardService := service.NewDashboardService(db, logger)
+	repairService := service.NewRepairService(repairRepo, stationRepo, db, logger)
 
 	// 处理器层
 	authHandler := handler.NewAuthHandler(authService, userService, logger)
@@ -79,6 +81,7 @@ func main() {
 	tournamentHandler := handler.NewTournamentHandler(tournamentService, logger)
 	auditHandler := handler.NewAuditHandler(auditService, logger)
 	dashboardHandler := handler.NewDashboardHandler(dashboardService, logger)
+	repairHandler := handler.NewRepairHandler(repairService, logger)
 
 	hub := handler.NewStationHub(logger)
 	go hub.Run()
@@ -114,6 +117,7 @@ func main() {
 	router.RegisterSession(api, sessionHandler, cfg.JWTSecret)
 	router.RegisterTournament(api, tournamentHandler, cfg.JWTSecret)
 	router.RegisterAudit(api, auditHandler, cfg.JWTSecret)
+	router.RegisterRepair(api, repairHandler, cfg.JWTSecret)
 	router.RegisterDashboard(api, dashboardHandler, cfg.JWTSecret)
 	router.RegisterWS(api, wsHandler)
 

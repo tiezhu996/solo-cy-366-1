@@ -72,7 +72,9 @@ func (h *StationHandler) UpdateStatus(c *gin.Context) {
 		response.Fail(c, 400, constants.CodeValidation, "机位状态参数校验失败："+err.Error())
 		return
 	}
-	station, err := h.stationService.UpdateStatus(idReq.ID, &req)
+	username, _ := c.Get("username")
+	operator, _ := username.(string)
+	station, err := h.stationService.UpdateStatus(idReq.ID, &req, operator)
 	if err != nil {
 		h.abort(c, err)
 		return

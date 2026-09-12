@@ -177,3 +177,29 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at DATETIME(3),
     KEY idx_audit_logs_user (user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- 机位报修闭环：标记故障登记（pending），恢复空闲填写处理结果并关闭（closed）。
+-- open_station_id 生成列 + 唯一索引保证同一机位仅允许一条待处理报修。
+CREATE TABLE IF NOT EXISTS repair_records (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    station_id BIGINT UNSIGNED NOT NULL,
+    reason VARCHAR(500) NOT NULL,
+    status VARCHAR(16) DEFAULT 'pending',
+    report_user_id BIGINT UNSIGNED DEFAULT 0,
+    report_by_name VARCHAR(64) DEFAULT '',
+    report_role VARCHAR(16) DEFAULT '',
+    reported_at DATETIME(3),
+    handle_result VARCHAR(500) DEFAULT '',
+    handle_user_id BIGINT UNSIGNED DEFAULT 0,
+    handle_by_name VARCHAR(64) DEFAULT '',
+    handle_role VARCHAR(16) DEFAULT '',
+    handled_at DATETIME(3),
+    created_at DATETIME(3),
+    updated_at DATETIME(3),
+    open_station_id BIGINT UNSIGNED GENERATED ALWAYS AS
+        (CASE WHEN status = 'pending' THEN station_id ELSE NULL END) VIRTUAL,
+    UNIQUE KEY uk_repair_open_station (open_station_id),
+    KEY idx_repair_records_station (station_id),
+    KEY idx_repair_records_status (status),
+    KEY idx_repair_records_reported (reported_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

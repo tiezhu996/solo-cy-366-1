@@ -19,6 +19,8 @@ const (
 	CodeReservation  = 40007
 	CodeSessionOpen  = 40008
 	CodeTournament   = 40009
+	CodeRepairOpen   = 40010
+	CodeRepairNone   = 40011
 )
 
 // 错误码与默认文案映射。
@@ -40,4 +42,6 @@ var ErrorMessages = map[int]string{
 	CodeReservation:  "预约状态不允许该操作",
 	CodeSessionOpen:  "该机位已有进行中的上机记录",
 	CodeTournament:   "赛事状态不允许该操作",
+	CodeRepairOpen:   "该机位已有待处理报修记录，请勿重复登记",
+	CodeRepairNone:   "该机位没有待处理的报修记录，无法关闭报修",
 }
