@@ -3,10 +3,11 @@
 // 本文件覆盖需要经过真实路由栈的规则（JWT 认证中间件 + RBAC 权限中间件 + 参数绑定校验）：
 //
 //	R3 HTTP 重复登记返回 409/code=40010
-//	R4 HTTP 无待处理记录关闭返回 409/code=40011；非故障机位关闭返回 409
+//	R4 HTTP 非故障机位关闭返回 409
 //	R5 HTTP 使用中/已预约机位登记返回 409；机位不存在返回 404
 //	R9 未登录（401）、会员越权（403）：登记/关闭/报修管理列表
 //	R10 非法状态枚举被参数校验拒绝（400/code=42200）；旧状态接口同样拒绝绕过
+//	R11 HTTP 故障但无待处理单的机位凭处理结果补录恢复（legacy=true）
 //
 // service 层业务规则（R1/R2/R6/R7/R8）见 internal/service/repair_service_test.go。
 // 每个用例使用独立 DSN 的内存 sqlite 库，可连续反复运行。
@@ -335,7 +336,7 @@ func TestHTTPRuleReportFlow(t *testing.T) {
 	})
 }
 
-// TestHTTPRuleIllegalStatus R5：使用中/已预约不能登记；不存在机位 404；故障无报修单不能关闭。
+// TestHTTPRuleIllegalStatus R5：使用中/已预约不能登记；不存在机位 404；R11 历史遗留故障补录恢复。
 func TestHTTPRuleIllegalStatus(t *testing.T) {
 	e := newHTTPEnv(t)
 
@@ -363,12 +364,50 @@ func TestHTTPRuleIllegalStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("故障但无待处理报修单不能关闭", func(t *testing.T) {
-		const rule = "R4 HTTP 无待处理记录不能关闭"
-		// station 4 预置为 fault 但没有任何报修记录
-		st, b := e.do("admin", http.MethodPost, "/api/v1/stations/4/repair-close", map[string]string{"handle_result": "修好了"})
-		if st != http.StatusConflict || b.Code != constants.CodeRepairNone {
-			failRule(t, rule, "期望 409/%d，实际 %d/%d %s", constants.CodeRepairNone, st, b.Code, b.Msg)
+	t.Run("R11 故障无报修单可凭结果恢复并补录", func(t *testing.T) {
+		const rule = "R11 HTTP 历史遗留故障自愈"
+		// station 4 预置为 fault 但没有任何报修记录（历史脏数据）
+		st, b := e.do("admin", http.MethodPost, "/api/v1/stations/4/repair-close", map[string]string{"handle_result": "主板松动已紧固"})
+		if st != http.StatusOK || b.Code != constants.CodeOK {
+			failRule(t, rule, "遗留故障应可凭结果恢复: %d/%d %s", st, b.Code, b.Msg)
+		}
+		var resp struct {
+			Repair  model.RepairRecord `json:"repair"`
+			Station model.Station      `json:"station"`
+			Legacy  bool               `json:"legacy"`
+		}
+		_ = json.Unmarshal(b.Data, &resp)
+		if !resp.Legacy {
+			failRule(t, rule, "应返回 legacy=true 标记补录路径")
+		}
+		if resp.Station.Status != constants.StationIdle {
+			failRule(t, rule, "机位应恢复 idle: got=%s", resp.Station.Status)
+		}
+		if resp.Repair.Status != constants.RepairClosed || resp.Repair.HandleResult != "主板松动已紧固" {
+			failRule(t, rule, "补录记录应为 closed 且带处理结果: %+v", resp.Repair)
+		}
+		if resp.Repair.HandleByName != "admin" || resp.Repair.HandleRole != constants.RoleAdmin || resp.Repair.HandledAt == nil {
+			failRule(t, rule, "处理角色/时间快照错误: name=%s role=%s at=%v",
+				resp.Repair.HandleByName, resp.Repair.HandleRole, resp.Repair.HandledAt)
+		}
+		if resp.Repair.ReportUserID != 0 || resp.Repair.ReportByName != "" {
+			failRule(t, rule, "遗留补录不应有登记人快照: %+v", resp.Repair)
+		}
+		// 详情：机位空闲、无待处理单、历史含 1 条已关闭记录
+		_, db := e.do("staff", http.MethodGet, "/api/v1/stations/4/detail", nil)
+		var detail struct {
+			Station struct {
+				Status string `json:"status"`
+			} `json:"station"`
+			OpenRepair    any                  `json:"open_repair"`
+			RepairRecords []model.RepairRecord `json:"repair_records"`
+		}
+		_ = json.Unmarshal(db.Data, &detail)
+		if detail.Station.Status != constants.StationIdle || detail.OpenRepair != nil {
+			failRule(t, rule, "恢复后详情应为 idle 且无待处理单: %s", db.Data)
+		}
+		if len(detail.RepairRecords) != 1 || detail.RepairRecords[0].Status != constants.RepairClosed {
+			failRule(t, rule, "历史应恰好 1 条已关闭记录: %d", len(detail.RepairRecords))
 		}
 	})
 }

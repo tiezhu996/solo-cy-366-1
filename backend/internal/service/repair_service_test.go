@@ -22,14 +22,17 @@ import (
 //  R1 空闲机位登记报修：机位 idle->fault，生成 pending 记录，原因/登记角色/登记时间正确
 //  R2 填写处理结果恢复：机位 fault->idle，记录 pending->closed，结果/处理角色/处理时间正确
 //  R3 同一机位仅允许一条待处理报修：重复登记返回 CodeRepairOpen，不新增记录
-//  R4 仅故障机位且存在待处理记录时可关闭：
-//     - 故障但无待处理记录 -> CodeRepairNone
+//  R4 仅故障机位可关闭：
 //     - 非故障机位关闭     -> CodeConflict
+//     - 故障且有待处理单   -> 正常关闭该单（R2）
 //  R5 使用中/已预约机位不能登记故障：CodeConflict
 //  R6 原因/结果必填（空白同样拒绝），且不落库
 //  R7 闭环可循环；机位详情只展示最近 20 条历史，更多记录可通过分页列表查到
 //  R8 原状态流转接口不得绕过报修闭环：idle->fault / fault->idle 均被拒绝；
 //     原有非故障状态操作（reserved->idle）保持可用
+//  R11 故障但无待处理报修单的机位（历史遗留脏数据）不再卡死：
+//     填写处理结果后直接补录一条已关闭报修记录并恢复空闲；记录留存处理结果/角色/时间；
+//     空白结果仍拒绝；恢复后可正常重新登记
 //
 // 稳定性：每个用例使用独立 DSN 的内存 sqlite 库（mode=memory），无外部依赖、
 // 无端口、无随机数据，可连续反复运行；断言信息以「规则名」开头，失败即可指认被破坏的规则。
@@ -185,9 +188,12 @@ func TestRepairRuleReportAndRecover(t *testing.T) {
 	}
 
 	// R2 恢复（换店员操作，验证处理角色快照）
-	closed, recovered, err := f.repairSvc.Close(ruleStaff, st.ID, "已更换键鼠并测试通过")
+	closed, recovered, legacy, err := f.repairSvc.Close(ruleStaff, st.ID, "已更换键鼠并测试通过")
 	if err != nil {
 		failRule(t, rule, "关闭报修不应失败: %v", err)
+	}
+	if legacy {
+		failRule(t, rule, "正常闭环不应走历史遗留补录路径")
 	}
 	assertClosed(t, rule, closed, ruleStaff, "已更换键鼠并测试通过")
 	if recovered.Status != constants.StationIdle {
@@ -228,34 +234,113 @@ func TestRepairRuleDuplicateRejected(t *testing.T) {
 	assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
 }
 
-// TestRepairRuleCloseGuards R4：无待处理记录/非故障状态不能关闭。
+// TestRepairRuleCloseGuards R4/R11：关闭操作的守卫与历史遗留故障自愈。
 func TestRepairRuleCloseGuards(t *testing.T) {
-	t.Run("fault_without_open_record_拒绝", func(t *testing.T) {
-		const rule = "R4a 故障但无待处理记录不能关闭"
-		f := newRepairFixture(t)
-		st := f.seedStation(t, constants.StationFault) // 历史脏数据：故障但无报修单
-		_, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "修好了")
-		if err == nil {
-			failRule(t, rule, "无待处理记录时关闭必须被拒绝")
-		}
-		if code := appErrorCode(t, err, rule); code != constants.CodeRepairNone {
-			failRule(t, rule, "错误码应为 %d(CodeRepairNone): got=%d", constants.CodeRepairNone, code)
-		}
-		assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
-	})
-
-	t.Run("idle_station_拒绝", func(t *testing.T) {
+	t.Run("R4b 非故障机位关闭被拒绝", func(t *testing.T) {
 		const rule = "R4b 非故障机位不能关闭报修"
 		f := newRepairFixture(t)
 		st := f.seedStation(t, constants.StationIdle)
-		_, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "修好了")
+		_, _, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "修好了")
 		if err == nil {
 			failRule(t, rule, "空闲机位关闭报修必须被拒绝")
 		}
 		if code := appErrorCode(t, err, rule); code != constants.CodeConflict {
 			failRule(t, rule, "错误码应为 %d(CodeConflict): got=%d", constants.CodeConflict, code)
 		}
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle)
 	})
+}
+
+// TestRepairRuleLegacyFaultRecovered R11：故障但没有待处理报修单的机位（历史遗留）
+// 填写处理结果后可恢复空闲，并补录一条已关闭报修记录，不再卡死。
+func TestRepairRuleLegacyFaultRecovered(t *testing.T) {
+	const rule = "R11 历史遗留故障可凭处理结果恢复"
+	f := newRepairFixture(t)
+	st := f.seedStation(t, constants.StationFault) // 历史脏数据：故障但无报修单
+
+	// 空白处理结果仍拒绝，且不落任何记录
+	if _, _, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "   "); err == nil {
+		failRule(t, rule, "空白处理结果必须被拒绝")
+	} else if appErrorCode(t, err, rule) != constants.CodeValidation {
+		failRule(t, rule, "空白结果错误码应为 %d: got=%d", constants.CodeValidation, appErrorCode(t, err, rule))
+	}
+	var before int64
+	f.db.Model(&model.RepairRecord{}).Count(&before)
+	if before != 0 {
+		failRule(t, rule, "校验失败不应落库: records=%d", before)
+	}
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+
+	// 店员填写处理结果后恢复空闲（换店员，验证处理角色快照）
+	rec, station, legacy, err := f.repairSvc.Close(ruleStaff, st.ID, "排查为主板松动，已紧固并复测正常")
+	if err != nil {
+		failRule(t, rule, "遗留故障恢复不应失败: %v", err)
+	}
+	if !legacy {
+		failRule(t, rule, "无待处理单时应标记 legacy=true（补录已关闭记录）")
+	}
+	if station.Status != constants.StationIdle {
+		failRule(t, rule, "机位应恢复 idle: got=%s", station.Status)
+	}
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle)
+
+	// 补录记录为已关闭，无登记人（历史遗留），但完整留存处理结果/角色/时间，原因留痕
+	if rec.Status != constants.RepairClosed {
+		failRule(t, rule, "补录记录应为 closed: got=%s", rec.Status)
+	}
+	if rec.HandleResult != "排查为主板松动，已紧固并复测正常" {
+		failRule(t, rule, "处理结果错误: got=%q", rec.HandleResult)
+	}
+	if rec.HandleUserID != ruleStaff.UserID || rec.HandleByName != ruleStaff.Username || rec.HandleRole != constants.RoleStaff {
+		failRule(t, rule, "处理角色快照错误: got=(%d,%s,%s)", rec.HandleUserID, rec.HandleByName, rec.HandleRole)
+	}
+	if rec.HandledAt == nil || rec.HandledAt.IsZero() {
+		failRule(t, rule, "处理时间不应为空")
+	}
+	if rec.ReportUserID != 0 || rec.ReportByName != "" || rec.ReportRole != "" {
+		failRule(t, rule, "遗留补录不应有登记人快照: got=(%d,%s,%s)", rec.ReportUserID, rec.ReportByName, rec.ReportRole)
+	}
+	if rec.Reason != constants.MsgRepairLegacyReason {
+		failRule(t, rule, "补录原因应为历史遗留占位文案: got=%q", rec.Reason)
+	}
+	if rec.ReportedAt.IsZero() {
+		failRule(t, rule, "补录记录 reported_at 不应为零值")
+	}
+
+	// 无待处理报修、历史恰好 1 条已关闭记录
+	if n := countPending(t, rule, f.db, st.ID); n != 0 {
+		failRule(t, rule, "恢复后不应存在待处理报修: got=%d", n)
+	}
+	var closedCount int64
+	f.db.Model(&model.RepairRecord{}).Where("station_id = ? AND status = ?", st.ID, constants.RepairClosed).Count(&closedCount)
+	if closedCount != 1 {
+		failRule(t, rule, "应补录恰好 1 条已关闭记录: got=%d", closedCount)
+	}
+
+	// 恢复后机位可正常重新登记报修（闭环可循环）
+	rec2, faultStation, err := f.repairSvc.Report(ruleAdmin, st.ID, "恢复后再次故障")
+	if err != nil {
+		failRule(t, rule, "恢复后重新登记不应失败: %v", err)
+	}
+	assertPending(t, rule, rec2, st.ID, ruleAdmin, "恢复后再次故障")
+	if faultStation.Status != constants.StationFault {
+		failRule(t, rule, "重新登记后机位应为 fault: got=%s", faultStation.Status)
+	}
+
+	// 此时存在待处理单，再次走关闭应走正常路径（legacy=false）并成功
+	rec3, idleStation, legacy3, err := f.repairSvc.Close(ruleAdmin, st.ID, "第二次修复完成")
+	if err != nil {
+		failRule(t, rule, "正常关闭不应失败: %v", err)
+	}
+	if legacy3 {
+		failRule(t, rule, "存在待处理单时应走正常关闭路径，legacy 必须为 false")
+	}
+	if rec3.ID == rec.ID || rec3.Status != constants.RepairClosed {
+		failRule(t, rule, "第二次关闭应作用于新报修单 #%d，实际记录 #%d status=%s", rec2.ID, rec3.ID, rec3.Status)
+	}
+	if idleStation.Status != constants.StationIdle {
+		failRule(t, rule, "机位应再次恢复 idle: got=%s", idleStation.Status)
+	}
 }
 
 // TestRepairRuleReportIllegalStatus R5：使用中/已预约不能登记故障。
@@ -316,7 +401,7 @@ func TestRepairRuleRequiredFields(t *testing.T) {
 			failRule(t, rule, "前置登记失败: %v", err)
 		}
 		for _, result := range []string{"", "   "} {
-			if _, _, err := f.repairSvc.Close(ruleAdmin, st.ID, result); err == nil {
+			if _, _, _, err := f.repairSvc.Close(ruleAdmin, st.ID, result); err == nil {
 				failRule(t, rule, "空白处理结果(%q)必须被拒绝", result)
 			} else if appErrorCode(t, err, rule) != constants.CodeValidation {
 				failRule(t, rule, "空白结果错误码应为 %d: got=%d", constants.CodeValidation, appErrorCode(t, err, rule))
@@ -362,9 +447,12 @@ func TestRepairRuleDetailHistoryOverTwenty(t *testing.T) {
 		if station.Status != constants.StationFault {
 			failRule(t, rule, "第%d轮登记后机位应为 fault: got=%s", i+1, station.Status)
 		}
-		closed, station, err := f.repairSvc.Close(handler, st.ID, results[i])
+		closed, station, legacy, err := f.repairSvc.Close(handler, st.ID, results[i])
 		if err != nil {
 			failRule(t, rule, "第%d轮恢复失败: %v", i+1, err)
+		}
+		if legacy {
+			failRule(t, rule, "第%d轮为正常闭环，不应走遗留补录", i+1)
 		}
 		assertClosed(t, rule, closed, handler, results[i])
 		if station.Status != constants.StationIdle {

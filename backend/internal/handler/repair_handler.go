@@ -59,12 +59,17 @@ func (h *RepairHandler) Close(c *gin.Context) {
 		return
 	}
 	op := operatorFromContext(c)
-	rec, station, err := h.repairService.Close(op, idReq.ID, req.HandleResult)
+	rec, station, legacy, err := h.repairService.Close(op, idReq.ID, req.HandleResult)
 	if err != nil {
 		h.abort(c, fmt.Errorf("repair handler close stationID=%d role=%s: %w", idReq.ID, op.Role, err))
 		return
 	}
-	response.OKMessage(c, constants.MsgRepairCloseOK, gin.H{"repair": rec, "station": station})
+	if legacy {
+		// 故障机位无待处理报修单（历史遗留），已凭处理结果补录已关闭记录并恢复空闲
+		response.OKMessage(c, "机位已恢复空闲（无待处理报修单，已补录已关闭报修记录）", gin.H{"repair": rec, "station": station, "legacy": legacy})
+		return
+	}
+	response.OKMessage(c, constants.MsgRepairCloseOK, gin.H{"repair": rec, "station": station, "legacy": legacy})
 }
 
 // ListByStation 查询机位报修记录（机位详情使用）。

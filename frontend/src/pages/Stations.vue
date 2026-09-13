@@ -68,7 +68,7 @@
             @click="openReport"
           >标记故障并登记报修</van-button>
           <van-button
-            v-if="detail.station.status === STATION_STATUS.FAULT && detail.open_repair"
+            v-if="detail.station.status === STATION_STATUS.FAULT"
             type="primary" size="small"
             @click="openClose"
           >恢复空闲（关闭报修）</van-button>
@@ -241,8 +241,8 @@ async function submitClose() {
   }
   submitting.value = true
   try {
-    await closeRepair(selected.value.id, handleResult.value.trim())
-    showSuccessToast('报修已关闭，机位恢复空闲')
+    const { legacy } = await closeRepair(selected.value.id, handleResult.value.trim())
+    showSuccessToast(legacy ? '机位已恢复空闲（无待处理报修单，已补录记录）' : '报修已关闭，机位恢复空闲')
     showClose.value = false
     await refreshDetail()
   } catch { /* toast 已处理 */ } finally {

@@ -14,6 +14,7 @@ var LogTemplates = map[string]string{
 	"station_delete_ok":      "station delete success, stationID=%d",
 	"repair_create_ok":       "repair record create success, repairID=%d, stationID=%d, reason=%s, operator=%s, role=%s",
 	"repair_close_ok":        "repair record close success, repairID=%d, stationID=%d, result=%s, operator=%s, role=%s",
+	"repair_close_legacy":    "repair legacy fault recovered, repairID=%d created closed for stationID=%d, result=%s, operator=%s, role=%s",
 	"repair_repeat_reject":   "repair record duplicate rejected, stationID=%d, operator=%s, role=%s",
 	"repair_list_query":      "repair record list query, stationID=%d, status=%s",
 	"recharge_create_ok":     "member recharge success, userID=%d, amount=%f, method=%s",

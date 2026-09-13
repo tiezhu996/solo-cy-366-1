@@ -29,6 +29,8 @@ const (
 	MsgRepairStationFault   = "仅故障机位可以登记报修（实体：station，字段：status）"
 	MsgRepairToIdleOnly     = "存在待处理报修时，机位仅允许恢复为空闲（实体：station，字段：status）"
 	MsgRepairRoleReject     = "当前角色无权操作报修闭环（实体：repair_record，允许角色：管理员/店员）"
+	// MsgRepairLegacyReason 故障机位缺少待处理报修单（历史脏数据）时，补录已关闭记录的占位原因。
+	MsgRepairLegacyReason = "历史故障遗留（无待处理报修登记）"
 )
 
 // 日志文案模板（非格式化部分）。

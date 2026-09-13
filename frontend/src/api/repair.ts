@@ -34,9 +34,10 @@ export function reportRepair(stationId: number, reason: string) {
   )
 }
 
-// 恢复空闲并关闭报修（管理员/店员）
+// 恢复空闲并关闭报修（管理员/店员）。
+// legacy=true 表示该机位故障但无待处理报修单（历史遗留），后端已补录一条已关闭记录。
 export function closeRepair(stationId: number, handleResult: string) {
-  return post<{ repair: RepairRecord; station: import('./station').Station }>(
+  return post<{ repair: RepairRecord; station: import('./station').Station; legacy?: boolean }>(
     `/stations/${stationId}/repair-close`,
     { handle_result: handleResult },
   )
