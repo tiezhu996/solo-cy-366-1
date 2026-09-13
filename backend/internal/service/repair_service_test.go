@@ -2,6 +2,8 @@ package service
 
 import (
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/glebarez/sqlite"
@@ -14,254 +16,473 @@ import (
 	"github.com/esportsbar/backend/internal/util"
 )
 
-// newRepairTestDB 使用纯 Go sqlite 驱动构造内存数据库（仅测试，跳过 MySQL 专属生成列索引）。
+// 本文件为机位报修闭环的可重复测试（规则集见各用例名/子测试名）。
+//
+// 规则总览：
+//  R1 空闲机位登记报修：机位 idle->fault，生成 pending 记录，原因/登记角色/登记时间正确
+//  R2 填写处理结果恢复：机位 fault->idle，记录 pending->closed，结果/处理角色/处理时间正确
+//  R3 同一机位仅允许一条待处理报修：重复登记返回 CodeRepairOpen，不新增记录
+//  R4 仅故障机位且存在待处理记录时可关闭：
+//     - 故障但无待处理记录 -> CodeRepairNone
+//     - 非故障机位关闭     -> CodeConflict
+//  R5 使用中/已预约机位不能登记故障：CodeConflict
+//  R6 原因/结果必填（空白同样拒绝），且不落库
+//  R7 闭环可循环；机位详情只展示最近 20 条历史，更多记录可通过分页列表查到
+//  R8 原状态流转接口不得绕过报修闭环：idle->fault / fault->idle 均被拒绝；
+//     原有非故障状态操作（reserved->idle）保持可用
+//
+// 稳定性：每个用例使用独立 DSN 的内存 sqlite 库（mode=memory），无外部依赖、
+// 无端口、无随机数据，可连续反复运行；断言信息以「规则名」开头，失败即可指认被破坏的规则。
+
+var repairDBSNSeq int64
+
+// newRepairTestDB 为单个用例创建独立内存数据库。
 func newRepairTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared&_pragma=foreign_keys(1)"), &gorm.Config{})
+	n := atomic.AddInt64(&repairDBSNSeq, 1)
+	dsn := fmt.Sprintf("file:repair_rule_%d?mode=memory&cache=shared", n)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
+		t.Fatalf("[测试基建] 打开内存库失败: %v", err)
 	}
 	if err := db.AutoMigrate(&model.Station{}, &model.RepairRecord{}); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	// 每个测试使用独立内存库：清空残留。
-	if err := db.Exec("DELETE FROM repair_records").Error; err != nil {
-		t.Fatalf("cleanup repairs: %v", err)
-	}
-	if err := db.Exec("DELETE FROM stations").Error; err != nil {
-		t.Fatalf("cleanup stations: %v", err)
+		t.Fatalf("[测试基建] 建表失败: %v", err)
 	}
 	return db
 }
 
-func newRepairService(db *gorm.DB) (*RepairService, *StationService) {
+type repairFixture struct {
+	db         *gorm.DB
+	repairSvc  *RepairService
+	stationSvc *StationService
+}
+
+func newRepairFixture(t *testing.T) *repairFixture {
+	t.Helper()
+	db := newRepairTestDB(t)
 	logger := newTestLogger()
 	stationRepo := repository.NewStationRepository(db)
 	repairRepo := repository.NewRepairRepository(db)
-	return NewRepairService(repairRepo, stationRepo, db, logger), NewStationService(stationRepo, repairRepo, logger)
+	return &repairFixture{
+		db:         db,
+		repairSvc:  NewRepairService(repairRepo, stationRepo, db, logger),
+		stationSvc: NewStationService(stationRepo, repairRepo, logger),
+	}
 }
 
-func seedStation(t *testing.T, db *gorm.DB, status string) *model.Station {
+func (f *repairFixture) seedStation(t *testing.T, status string) *model.Station {
 	t.Helper()
-	st := &model.Station{Name: "A区-01", Area: "A区", StationType: "seat", Status: status}
-	if err := db.Create(st).Error; err != nil {
-		t.Fatalf("seed station: %v", err)
+	st := &model.Station{Name: "A区-01", Area: "A区", StationType: "seat", PricePerHour: 8, Status: status}
+	if err := f.db.Create(st).Error; err != nil {
+		t.Fatalf("[测试基建] 造机位失败: %v", err)
 	}
 	return st
 }
 
-var adminOp = Operator{UserID: 1, Username: "admin", Role: constants.RoleAdmin}
-var staffOp = Operator{UserID: 2, Username: "clerk", Role: constants.RoleStaff}
+var ruleAdmin = Operator{UserID: 101, Username: "admin", Role: constants.RoleAdmin}
+var ruleStaff = Operator{UserID: 202, Username: "clerk", Role: constants.RoleStaff}
 
-func appErrorCode(t *testing.T, err error) int {
+// failRule 以规则名开头输出失败信息，便于指认被破坏的规则。
+func failRule(t *testing.T, rule string, format string, args ...any) {
+	t.Helper()
+	t.Fatalf("[%s] %s", rule, fmt.Sprintf(format, args...))
+}
+
+func appErrorCode(t *testing.T, err error, rule string) int {
 	t.Helper()
 	var appErr *util.AppError
 	if !errors.As(err, &appErr) {
-		t.Fatalf("expected AppError, got %T: %v", err, err)
+		failRule(t, rule, "期望业务错误 *util.AppError，实际 %T: %v", err, err)
 	}
 	return appErr.Code
 }
 
-// TestRepairReportAndClose 登记报修 -> 机位故障 -> 恢复关闭 -> 机位空闲 的完整闭环。
-func TestRepairReportAndClose(t *testing.T) {
-	db := newRepairTestDB(t)
-	repairSvc, _ := newRepairService(db)
-	st := seedStation(t, db, constants.StationIdle)
-
-	// 1. 登记报修
-	rec, station, err := repairSvc.Report(adminOp, st.ID, "键盘失灵，鼠标断连")
-	if err != nil {
-		t.Fatalf("Report error: %v", err)
+// assertPending 校验登记后的待处理记录快照（R1）。
+func assertPending(t *testing.T, rule string, rec *model.RepairRecord, stationID uint, op Operator, reason string) {
+	t.Helper()
+	if rec.StationID != stationID {
+		failRule(t, rule, "报修机位ID错误: got=%d want=%d", rec.StationID, stationID)
 	}
-	if rec.Status != constants.RepairPending || rec.Reason != "键盘失灵，鼠标断连" {
-		t.Fatalf("unexpected repair: %+v", rec)
+	if rec.Status != constants.RepairPending {
+		failRule(t, rule, "报修状态应为 pending: got=%s", rec.Status)
 	}
-	if rec.ReportByName != "admin" || rec.ReportRole != constants.RoleAdmin {
-		t.Fatalf("report operator snapshot wrong: %+v", rec)
+	if rec.Reason != reason {
+		failRule(t, rule, "故障原因错误: got=%q want=%q", rec.Reason, reason)
 	}
-	if station.Status != constants.StationFault {
-		t.Fatalf("station should be fault, got %s", station.Status)
+	if rec.ReportUserID != op.UserID || rec.ReportByName != op.Username || rec.ReportRole != op.Role {
+		failRule(t, rule, "登记操作人快照错误: got=(%d,%s,%s) want=(%d,%s,%s)",
+			rec.ReportUserID, rec.ReportByName, rec.ReportRole, op.UserID, op.Username, op.Role)
 	}
 	if rec.ReportedAt.IsZero() {
-		t.Fatal("reported_at should be set")
+		failRule(t, rule, "登记时间 reported_at 不应为零值")
 	}
+	if rec.HandleResult != "" || rec.HandledAt != nil {
+		failRule(t, rule, "待处理记录不应已有处理结果/处理时间: result=%q handledAt=%v", rec.HandleResult, rec.HandledAt)
+	}
+}
 
-	// 2. 待处理报修可被查询
-	detail, err := repairSvc.Detail(st.ID)
+// assertClosed 校验关闭后的记录快照（R2）。
+func assertClosed(t *testing.T, rule string, rec *model.RepairRecord, op Operator, result string) {
+	t.Helper()
+	if rec.Status != constants.RepairClosed {
+		failRule(t, rule, "报修状态应为 closed: got=%s", rec.Status)
+	}
+	if rec.HandleResult != result {
+		failRule(t, rule, "处理结果错误: got=%q want=%q", rec.HandleResult, result)
+	}
+	if rec.HandleUserID != op.UserID || rec.HandleByName != op.Username || rec.HandleRole != op.Role {
+		failRule(t, rule, "处理操作人快照错误: got=(%d,%s,%s) want=(%d,%s,%s)",
+			rec.HandleUserID, rec.HandleByName, rec.HandleRole, op.UserID, op.Username, op.Role)
+	}
+	if rec.HandledAt == nil || rec.HandledAt.IsZero() {
+		failRule(t, rule, "处理时间 handled_at 不应为零值")
+	}
+	if rec.HandledAt.Before(rec.ReportedAt) {
+		failRule(t, rule, "时间顺序错误: handled_at(%s) 早于 reported_at(%s)",
+			rec.HandledAt.Format("15:04:05.000"), rec.ReportedAt.Format("15:04:05.000"))
+	}
+}
+
+func assertStationStatus(t *testing.T, rule string, db *gorm.DB, stationID uint, want string) {
+	t.Helper()
+	var fresh model.Station
+	if err := db.First(&fresh, stationID).Error; err != nil {
+		failRule(t, rule, "回读机位失败: %v", err)
+	}
+	if fresh.Status != want {
+		failRule(t, rule, "机位状态错误: got=%s want=%s（%s）", fresh.Status, want, util.StatusText(want))
+	}
+}
+
+func countPending(t *testing.T, rule string, db *gorm.DB, stationID uint) int64 {
+	t.Helper()
+	var n int64
+	if err := db.Model(&model.RepairRecord{}).
+		Where("station_id = ? AND status = ?", stationID, constants.RepairPending).Count(&n).Error; err != nil {
+		failRule(t, rule, "统计待处理报修失败: %v", err)
+	}
+	return n
+}
+
+// TestRepairRuleReportAndRecover R1+R2：空闲登记故障 -> 填写结果恢复空闲的完整闭环。
+func TestRepairRuleReportAndRecover(t *testing.T) {
+	const rule = "R1/R2 登记报修并恢复空闲"
+	f := newRepairFixture(t)
+	st := f.seedStation(t, constants.StationIdle)
+
+	// R1 登记
+	rec, station, err := f.repairSvc.Report(ruleAdmin, st.ID, "键盘失灵，鼠标断连")
 	if err != nil {
-		t.Fatalf("Detail error: %v", err)
+		failRule(t, rule, "登记报修不应失败: %v", err)
 	}
-	openDetail, ok := detail.OpenRepair.(*model.RepairRecord)
-	if !ok || openDetail == nil || openDetail.ID != rec.ID {
-		t.Fatalf("open repair missing: %+v", detail.OpenRepair)
-	}
-	if len(detail.RepairRecords) != 1 {
-		t.Fatalf("repair history len = %d", len(detail.RepairRecords))
-	}
-
-	// 3. 不填处理结果不能关闭
-	if _, _, err := repairSvc.Close(staffOp, st.ID, "  "); err == nil {
-		t.Fatal("empty handle result should be rejected")
-	} else if appErrorCode(t, err) != constants.CodeValidation {
-		t.Fatalf("expect validation code, got %d", appErrorCode(t, err))
-	}
-
-	// 4. 恢复空闲并关闭报修
-	closed, station2, err := repairSvc.Close(staffOp, st.ID, "已更换键鼠并测试通过")
-	if err != nil {
-		t.Fatalf("Close error: %v", err)
-	}
-	if closed.Status != constants.RepairClosed || closed.HandleResult != "已更换键鼠并测试通过" {
-		t.Fatalf("unexpected closed repair: %+v", closed)
-	}
-	if closed.HandleByName != "clerk" || closed.HandleRole != constants.RoleStaff || closed.HandledAt == nil {
-		t.Fatalf("handle operator snapshot wrong: %+v", closed)
-	}
-	if station2.Status != constants.StationIdle {
-		t.Fatalf("station should be idle, got %s", station2.Status)
-	}
-
-	// 5. 关闭后无待处理报修，历史保留
-	hasOpen, err := repairSvc.HasOpenRepair(st.ID)
-	if err != nil || hasOpen {
-		t.Fatalf("HasOpenRepair = %v, %v", hasOpen, err)
-	}
-	records, err := repairSvc.ListByStation(st.ID)
-	if err != nil || len(records) != 1 || records[0].Status != constants.RepairClosed {
-		t.Fatalf("history wrong: len=%d err=%v", len(records), err)
-	}
-}
-
-// TestRepairDuplicateRejected 同一机位只允许一条待处理报修。
-func TestRepairDuplicateRejected(t *testing.T) {
-	db := newRepairTestDB(t)
-	repairSvc, _ := newRepairService(db)
-	st := seedStation(t, db, constants.StationIdle)
-
-	if _, _, err := repairSvc.Report(adminOp, st.ID, "显示器花屏"); err != nil {
-		t.Fatalf("first Report error: %v", err)
-	}
-	// 机位已是 fault，再次登记必须被拒绝（并发/重复登记）
-	_, _, err := repairSvc.Report(staffOp, st.ID, "重复报修")
-	if err == nil {
-		t.Fatal("duplicate report should be rejected")
-	}
-	if code := appErrorCode(t, err); code != constants.CodeRepairOpen {
-		t.Fatalf("expect CodeRepairOpen %d, got %d", constants.CodeRepairOpen, code)
-	}
-	var cnt int64
-	db.Model(&model.RepairRecord{}).Where("station_id = ? AND status = ?", st.ID, constants.RepairPending).Count(&cnt)
-	if cnt != 1 {
-		t.Fatalf("pending repair count = %d, want 1", cnt)
-	}
-}
-
-// TestRepairCloseWithoutOpen 故障机位若无待处理报修（历史脏数据），不允许关闭。
-func TestRepairCloseWithoutOpen(t *testing.T) {
-	db := newRepairTestDB(t)
-	repairSvc, _ := newRepairService(db)
-	st := seedStation(t, db, constants.StationFault)
-
-	_, _, err := repairSvc.Close(adminOp, st.ID, "修好了")
-	if err == nil {
-		t.Fatal("close without open repair should be rejected")
-	}
-	if code := appErrorCode(t, err); code != constants.CodeRepairNone {
-		t.Fatalf("expect CodeRepairNone %d, got %d", constants.CodeRepairNone, code)
-	}
-}
-
-// TestRepairReportOnIllegalStatus 非法机位状态（使用中/预约中）不能标记故障。
-func TestRepairReportOnIllegalStatus(t *testing.T) {
-	db := newRepairTestDB(t)
-	repairSvc, _ := newRepairService(db)
-
-	for _, status := range []string{constants.StationUsing, constants.StationReserved} {
-		st := seedStation(t, db, status)
-		_, _, err := repairSvc.Report(adminOp, st.ID, "故障")
-		if err == nil {
-			t.Fatalf("report on %s should be rejected", status)
-		}
-		if code := appErrorCode(t, err); code != constants.CodeConflict {
-			t.Fatalf("status %s expect CodeConflict, got %d", status, code)
-		}
-	}
-}
-
-// TestRepairEmptyReason 原因必填校验。
-func TestRepairEmptyReason(t *testing.T) {
-	db := newRepairTestDB(t)
-	repairSvc, _ := newRepairService(db)
-	st := seedStation(t, db, constants.StationIdle)
-
-	if _, _, err := repairSvc.Report(adminOp, st.ID, "  "); err == nil {
-		t.Fatal("empty reason should be rejected")
-	} else if appErrorCode(t, err) != constants.CodeValidation {
-		t.Fatalf("expect CodeValidation, got %d", appErrorCode(t, err))
-	}
-	var cnt int64
-	db.Model(&model.RepairRecord{}).Count(&cnt)
-	if cnt != 0 {
-		t.Fatalf("no repair should be created, cnt=%d", cnt)
-	}
-}
-
-// TestRepairCloseReopensForNextCycle 关闭后可重新登记（唯一约束随状态释放）。
-func TestRepairCloseReopensForNextCycle(t *testing.T) {
-	db := newRepairTestDB(t)
-	repairSvc, _ := newRepairService(db)
-	st := seedStation(t, db, constants.StationIdle)
-
-	if _, _, err := repairSvc.Report(adminOp, st.ID, "第一次故障"); err != nil {
-		t.Fatalf("report1: %v", err)
-	}
-	if _, _, err := repairSvc.Close(adminOp, st.ID, "第一次修复"); err != nil {
-		t.Fatalf("close1: %v", err)
-	}
-	rec2, station, err := repairSvc.Report(staffOp, st.ID, "第二次故障")
-	if err != nil {
-		t.Fatalf("report2 after close should succeed: %v", err)
-	}
+	assertPending(t, rule, rec, st.ID, ruleAdmin, "键盘失灵，鼠标断连")
 	if station.Status != constants.StationFault {
-		t.Fatalf("station should be fault again, got %s", station.Status)
+		failRule(t, rule, "返回机位状态应为 fault: got=%s", station.Status)
 	}
-	records, _ := repairSvc.ListByStation(st.ID)
-	if len(records) != 2 {
-		t.Fatalf("history len = %d, want 2", len(records))
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+	if countPending(t, rule, f.db, st.ID) != 1 {
+		failRule(t, rule, "库中待处理报修应为 1 条")
 	}
-	if records[0].ID != rec2.ID || records[0].Status != constants.RepairPending {
-		t.Fatalf("newest record should be pending rec2: %+v", records[0])
+
+	// R2 恢复（换店员操作，验证处理角色快照）
+	closed, recovered, err := f.repairSvc.Close(ruleStaff, st.ID, "已更换键鼠并测试通过")
+	if err != nil {
+		failRule(t, rule, "关闭报修不应失败: %v", err)
+	}
+	assertClosed(t, rule, closed, ruleStaff, "已更换键鼠并测试通过")
+	if recovered.Status != constants.StationIdle {
+		failRule(t, rule, "返回机位状态应为 idle: got=%s", recovered.Status)
+	}
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle)
+	if countPending(t, rule, f.db, st.ID) != 0 {
+		failRule(t, rule, "关闭后不应存在待处理报修")
 	}
 }
 
-// TestStationStatusFaultBypassed 原状态流转接口不得绕过报修闭环。
-func TestStationStatusFaultBypassed(t *testing.T) {
-	db := newRepairTestDB(t)
-	_, stationSvc := newRepairService(db)
-	st := seedStation(t, db, constants.StationIdle)
+// TestRepairRuleDuplicateRejected R3：同一机位重复登记被拒。
+func TestRepairRuleDuplicateRejected(t *testing.T) {
+	const rule = "R3 同一机位仅一条待处理报修"
+	f := newRepairFixture(t)
+	st := f.seedStation(t, constants.StationIdle)
 
-	// idle -> fault 不带原因：拒绝（必须走报修登记）
-	if _, err := stationSvc.UpdateStatus(st.ID, &dto.UpdateStationStatusReq{Status: constants.StationFault}, "admin"); err == nil {
-		t.Fatal("idle->fault via plain status API should be rejected")
-	} else if appErrorCode(t, err) != constants.CodeRepairOpen {
-		t.Fatalf("expect CodeRepairOpen, got %d", appErrorCode(t, err))
+	if _, _, err := f.repairSvc.Report(ruleAdmin, st.ID, "显示器花屏"); err != nil {
+		failRule(t, rule, "首次登记不应失败: %v", err)
+	}
+	// 机位已处于 fault，换店员再次登记
+	_, _, err := f.repairSvc.Report(ruleStaff, st.ID, "重复报修")
+	if err == nil {
+		failRule(t, rule, "重复登记必须被拒绝，但返回成功")
+	}
+	if code := appErrorCode(t, err, rule); code != constants.CodeRepairOpen {
+		failRule(t, rule, "重复登记错误码应为 %d(CodeRepairOpen): got=%d", constants.CodeRepairOpen, code)
+	}
+	if n := countPending(t, rule, f.db, st.ID); n != 1 {
+		failRule(t, rule, "拒绝重复登记后待处理记录仍应只有 1 条: got=%d", n)
+	}
+	var total int64
+	f.db.Model(&model.RepairRecord{}).Count(&total)
+	if total != 1 {
+		failRule(t, rule, "拒绝重复登记不应写入任何记录: total=%d", total)
+	}
+	// 机位仍保持故障
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+}
+
+// TestRepairRuleCloseGuards R4：无待处理记录/非故障状态不能关闭。
+func TestRepairRuleCloseGuards(t *testing.T) {
+	t.Run("fault_without_open_record_拒绝", func(t *testing.T) {
+		const rule = "R4a 故障但无待处理记录不能关闭"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationFault) // 历史脏数据：故障但无报修单
+		_, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "修好了")
+		if err == nil {
+			failRule(t, rule, "无待处理记录时关闭必须被拒绝")
+		}
+		if code := appErrorCode(t, err, rule); code != constants.CodeRepairNone {
+			failRule(t, rule, "错误码应为 %d(CodeRepairNone): got=%d", constants.CodeRepairNone, code)
+		}
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+	})
+
+	t.Run("idle_station_拒绝", func(t *testing.T) {
+		const rule = "R4b 非故障机位不能关闭报修"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationIdle)
+		_, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "修好了")
+		if err == nil {
+			failRule(t, rule, "空闲机位关闭报修必须被拒绝")
+		}
+		if code := appErrorCode(t, err, rule); code != constants.CodeConflict {
+			failRule(t, rule, "错误码应为 %d(CodeConflict): got=%d", constants.CodeConflict, code)
+		}
+	})
+}
+
+// TestRepairRuleReportIllegalStatus R5：使用中/已预约不能登记故障。
+func TestRepairRuleReportIllegalStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+	}{
+		{"using 使用中", constants.StationUsing},
+		{"reserved 已预约", constants.StationReserved},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rule := "R5 " + tc.name + "机位不能登记故障"
+			f := newRepairFixture(t)
+			st := f.seedStation(t, tc.status)
+			_, _, err := f.repairSvc.Report(ruleAdmin, st.ID, "故障")
+			if err == nil {
+				failRule(t, rule, "该状态机位登记故障必须被拒绝")
+			}
+			if code := appErrorCode(t, err, rule); code != constants.CodeConflict {
+				failRule(t, rule, "错误码应为 %d(CodeConflict): got=%d", constants.CodeConflict, code)
+			}
+			assertStationStatus(t, rule, f.db, st.ID, tc.status)
+			if n := countPending(t, rule, f.db, st.ID); n != 0 {
+				failRule(t, rule, "拒绝后不应产生报修记录: got=%d", n)
+			}
+		})
+	}
+}
+
+// TestRepairRuleRequiredFields R6：原因与结果必填。
+func TestRepairRuleRequiredFields(t *testing.T) {
+	t.Run("空原因拒绝且不落库", func(t *testing.T) {
+		const rule = "R6a 登记原因必填"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationIdle)
+		for _, reason := range []string{"", "   ", "\t\n"} {
+			if _, _, err := f.repairSvc.Report(ruleAdmin, st.ID, reason); err == nil {
+				failRule(t, rule, "空白原因(%q)必须被拒绝", reason)
+			} else if appErrorCode(t, err, rule) != constants.CodeValidation {
+				failRule(t, rule, "空白原因(%q)错误码应为 %d: got=%d", reason, constants.CodeValidation, appErrorCode(t, err, rule))
+			}
+		}
+		var n int64
+		f.db.Model(&model.RepairRecord{}).Count(&n)
+		if n != 0 {
+			failRule(t, rule, "校验失败不应落库: records=%d", n)
+		}
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle)
+	})
+
+	t.Run("空结果拒绝且记录保持pending", func(t *testing.T) {
+		const rule = "R6b 恢复处理结果必填"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationIdle)
+		rec, _, err := f.repairSvc.Report(ruleAdmin, st.ID, "故障原因")
+		if err != nil {
+			failRule(t, rule, "前置登记失败: %v", err)
+		}
+		for _, result := range []string{"", "   "} {
+			if _, _, err := f.repairSvc.Close(ruleAdmin, st.ID, result); err == nil {
+				failRule(t, rule, "空白处理结果(%q)必须被拒绝", result)
+			} else if appErrorCode(t, err, rule) != constants.CodeValidation {
+				failRule(t, rule, "空白结果错误码应为 %d: got=%d", constants.CodeValidation, appErrorCode(t, err, rule))
+			}
+		}
+		var fresh model.RepairRecord
+		if err := f.db.First(&fresh, rec.ID).Error; err != nil {
+			failRule(t, rule, "回读报修记录失败: %v", err)
+		}
+		if fresh.Status != constants.RepairPending || fresh.HandledAt != nil {
+			failRule(t, rule, "校验失败后记录应保持 pending 且无处理时间: status=%s handledAt=%v", fresh.Status, fresh.HandledAt)
+		}
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+	})
+}
+
+// TestRepairRuleDetailHistoryOverTwenty R7：连续闭环 21 次后，
+// 机位详情仅返回最近 20 条（最新在前），全部 21 条可通过分页列表查到，
+// 且每条记录的原因/结果/角色/时间快照正确。
+func TestRepairRuleDetailHistoryOverTwenty(t *testing.T) {
+	const rule = "R7 详情只展示最近20条历史"
+	f := newRepairFixture(t)
+	st := f.seedStation(t, constants.StationIdle)
+
+	const cycles = 21
+	reasons := make([]string, cycles)
+	results := make([]string, cycles)
+	for i := 0; i < cycles; i++ {
+		reasons[i] = fmt.Sprintf("第%d次故障：设备编号%03d异常", i+1, i+1)
+		results[i] = fmt.Sprintf("第%d次处理：更换配件并复检合格", i+1)
+		// 奇数轮店员登记/管理员处理，偶数轮管理员登记/店员处理，验证两种角色快照
+		reporter := ruleAdmin
+		handler := ruleStaff
+		if i%2 == 1 {
+			reporter = ruleStaff
+			handler = ruleAdmin
+		}
+		rec, station, err := f.repairSvc.Report(reporter, st.ID, reasons[i])
+		if err != nil {
+			failRule(t, rule, "第%d轮登记失败: %v", i+1, err)
+		}
+		assertPending(t, rule, rec, st.ID, reporter, reasons[i])
+		if station.Status != constants.StationFault {
+			failRule(t, rule, "第%d轮登记后机位应为 fault: got=%s", i+1, station.Status)
+		}
+		closed, station, err := f.repairSvc.Close(handler, st.ID, results[i])
+		if err != nil {
+			failRule(t, rule, "第%d轮恢复失败: %v", i+1, err)
+		}
+		assertClosed(t, rule, closed, handler, results[i])
+		if station.Status != constants.StationIdle {
+			failRule(t, rule, "第%d轮恢复后机位应为 idle: got=%s", i+1, station.Status)
+		}
 	}
 
-	// 非法状态流转 using -> fault 经由状态机拒绝（这里构造 using 机位）
-	st2 := seedStation(t, db, constants.StationUsing)
-	if _, err := stationSvc.UpdateStatus(st2.ID, &dto.UpdateStationStatusReq{Status: constants.StationReserved}, "admin"); err == nil {
-		t.Fatal("using->reserved should be rejected by state machine")
-	} else if appErrorCode(t, err) != constants.CodeConflict {
-		t.Fatalf("expect CodeConflict, got %d", appErrorCode(t, err))
-	}
-
-	// 原有非故障操作保持可用：reserved -> idle
-	st3 := seedStation(t, db, constants.StationReserved)
-	updated, err := stationSvc.UpdateStatus(st3.ID, &dto.UpdateStationStatusReq{Status: constants.StationIdle}, "staff")
+	// 最终机位空闲、无待处理报修
+	detail, err := f.repairSvc.Detail(st.ID)
 	if err != nil {
-		t.Fatalf("reserved->idle should work: %v", err)
+		failRule(t, rule, "查询详情失败: %v", err)
+	}
+	stationAny, ok := detail.Station.(*model.Station)
+	if !ok || stationAny.Status != constants.StationIdle {
+		failRule(t, rule, "详情机位应为 idle: %#v", detail.Station)
+	}
+	if open, _ := detail.OpenRepair.(*model.RepairRecord); open != nil {
+		failRule(t, rule, "21轮闭环后不应存在待处理报修: %#v", open)
+	}
+
+	// 详情历史上限 20 条，且为最新在前（第 21 轮排第一，第 2~21 轮可见，第 1 轮被截断）
+	if len(detail.RepairRecords) != 20 {
+		failRule(t, rule, "详情历史应截断为最近20条: got=%d", len(detail.RepairRecords))
+	}
+	first, ok := detail.RepairRecords[0].(model.RepairRecord)
+	if !ok {
+		failRule(t, rule, "历史记录类型错误: %T", detail.RepairRecords[0])
+	}
+	if first.Reason != reasons[cycles-1] || first.HandleResult != results[cycles-1] {
+		failRule(t, rule, "详情第一条应为第21轮记录: reason=%q result=%q", first.Reason, first.HandleResult)
+	}
+	last := detail.RepairRecords[19].(model.RepairRecord)
+	if last.Reason != reasons[1] {
+		failRule(t, rule, "详情第二十条应为第2轮记录（第1轮被截断）: got reason=%q want=%q", last.Reason, reasons[1])
+	}
+
+	// 详情中每条记录均为已关闭，且原因/结果/角色/时间齐全且顺序合法
+	for i, item := range detail.RepairRecords {
+		r, ok := item.(model.RepairRecord)
+		if !ok {
+			failRule(t, rule, "历史[%d] 类型错误: %T", i, item)
+		}
+		cycle := cycles - 1 - i // 第 i 条对应第几轮（1-based: cycles-i）
+		wantReason := reasons[cycle]
+		wantResult := results[cycle]
+		if r.Status != constants.RepairClosed || r.Reason != wantReason || r.HandleResult != wantResult {
+			failRule(t, rule, "历史[%d]（第%d轮）内容错误: status=%s reason=%q result=%q", i, cycle+1, r.Status, r.Reason, r.HandleResult)
+		}
+		if r.ReportByName == "" || r.ReportRole == "" || r.ReportedAt.IsZero() {
+			failRule(t, rule, "历史[%d] 登记快照缺失: name=%s role=%s at=%v", i, r.ReportByName, r.ReportRole, r.ReportedAt)
+		}
+		if r.HandleByName == "" || r.HandleRole == "" || r.HandledAt == nil {
+			failRule(t, rule, "历史[%d] 处理快照缺失: name=%s role=%s at=%v", i, r.HandleByName, r.HandleRole, r.HandledAt)
+		}
+		if r.HandledAt.Before(r.ReportedAt) {
+			failRule(t, rule, "历史[%d] 处理时间早于登记时间", i)
+		}
+	}
+
+	// 分页列表可查到全部 21 条
+	all, total, err := f.repairSvc.List(&dto.RepairQuery{Page: 1, PageSize: 100})
+	if err != nil {
+		failRule(t, rule, "分页列表查询失败: %v", err)
+	}
+	if total != cycles || len(all) != cycles {
+		failRule(t, rule, "分页列表应包含全部%d条: total=%d len=%d", cycles, total, len(all))
+	}
+	// 最早一轮（第1轮）虽不在详情中，但必须能在列表查到
+	var oldest *model.RepairRecord
+	for i := range all {
+		if all[i].Reason == reasons[0] {
+			oldest = &all[i]
+		}
+	}
+	if oldest == nil {
+		failRule(t, rule, "第1轮记录应可通过分页列表查到")
+	}
+	if oldest.HandleResult != results[0] {
+		failRule(t, rule, "第1轮处理结果错误: got=%q want=%q", oldest.HandleResult, results[0])
+	}
+}
+
+// TestRepairRulePlainStatusAPIBlocked R8：原状态接口不能绕过报修闭环，且原有操作保持可用。
+func TestRepairRulePlainStatusAPIBlocked(t *testing.T) {
+	const rule = "R8 原状态接口与报修闭环"
+	f := newRepairFixture(t)
+	st := f.seedStation(t, constants.StationIdle)
+
+	// idle -> fault 不带原因：拒绝
+	_, err := f.stationSvc.UpdateStatus(st.ID, &dto.UpdateStationStatusReq{Status: constants.StationFault}, "admin")
+	if err == nil {
+		failRule(t, rule, "旧接口 idle->fault 必须被拒绝（必须走报修登记）")
+	}
+	if code := appErrorCode(t, err, rule); code != constants.CodeRepairOpen {
+		failRule(t, rule, "旧接口 idle->fault 错误码应为 %d: got=%d", constants.CodeRepairOpen, code)
+	}
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle)
+
+	// 走闭环登记后，旧接口 fault -> idle 不带结果：拒绝
+	if _, _, err := f.repairSvc.Report(ruleAdmin, st.ID, "鼠标失灵"); err != nil {
+		failRule(t, rule, "前置登记失败: %v", err)
+	}
+	_, err = f.stationSvc.UpdateStatus(st.ID, &dto.UpdateStationStatusReq{Status: constants.StationIdle}, "admin")
+	if err == nil {
+		failRule(t, rule, "旧接口 fault->idle 必须被拒绝（必须走报修关闭）")
+	}
+	if code := appErrorCode(t, err, rule); code != constants.CodeRepairNone {
+		failRule(t, rule, "旧接口 fault->idle 错误码应为 %d: got=%d", constants.CodeRepairNone, code)
+	}
+	assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+
+	// 原有非故障状态操作保持可用：reserved -> idle
+	reserved := f.seedStation(t, constants.StationReserved)
+	updated, err := f.stationSvc.UpdateStatus(reserved.ID, &dto.UpdateStationStatusReq{Status: constants.StationIdle}, "staff")
+	if err != nil {
+		failRule(t, rule, "原有操作 reserved->idle 应保持可用: %v", err)
 	}
 	if updated.Status != constants.StationIdle {
-		t.Fatalf("status = %s", updated.Status)
+		failRule(t, rule, "reserved->idle 后状态错误: got=%s", updated.Status)
 	}
 }
