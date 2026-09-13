@@ -8,6 +8,7 @@
 //	R9 未登录（401）、会员越权（403）：登记/关闭/报修管理列表
 //	R10 非法状态枚举被参数校验拒绝（400/code=42200）；旧状态接口同样拒绝绕过
 //	R11 HTTP 故障但无待处理单的机位凭处理结果补录恢复（legacy=true）
+//	R12 HTTP 删除机位守卫：有待处理/已关闭报修记录返回 409/40012，无记录可删
 //
 // service 层业务规则（R1/R2/R6/R7/R8）见 internal/service/repair_service_test.go。
 // 每个用例使用独立 DSN 的内存 sqlite 库，可连续反复运行。
@@ -62,7 +63,7 @@ func newHTTPEnv(t *testing.T) *httpEnv {
 		{Name: "A区-01", Area: "A区", StationType: "seat", Status: constants.StationIdle},
 		{Name: "A区-02", Area: "A区", StationType: "seat", Status: constants.StationUsing},
 		{Name: "B区-01", Area: "B区", StationType: "seat", Status: constants.StationReserved},
-		{Name: "B区-02", Area: "B区", StationType: "seat", Status: constants.StationFault}, // 故障但无报修单（R4a）
+		{Name: "B区-02", Area: "B区", StationType: "seat", Status: constants.StationFault}, // 故障但无报修单（R11 遗留场景）
 	}
 	if err := db.Create(&stations).Error; err != nil {
 		t.Fatalf("[测试基建] 造机位失败: %v", err)
@@ -491,6 +492,105 @@ func TestHTTPRuleRepairList(t *testing.T) {
 		st, b := e.do("admin", http.MethodGet, "/api/v1/repairs?status=done", nil)
 		if st != http.StatusBadRequest || b.Code != constants.CodeValidation {
 			failRule(t, rule, "期望 400/%d，实际 %d/%d", constants.CodeValidation, st, b.Code)
+		}
+	})
+}
+
+// TestHTTPRuleDeleteGuards R12：删除机位守卫（待处理/已关闭/无记录），防止产生孤儿报修记录。
+func TestHTTPRuleDeleteGuards(t *testing.T) {
+	e := newHTTPEnv(t)
+
+	t.Run("会员与店员删除机位被403拒绝", func(t *testing.T) {
+		const rule = "R12 RBAC 仅管理员可删除机位"
+		if st, _ := e.do("member", http.MethodDelete, "/api/v1/stations/3", nil); st != http.StatusForbidden {
+			failRule(t, rule, "会员删除期望 403，实际 %d", st)
+		}
+		if st, _ := e.do("staff", http.MethodDelete, "/api/v1/stations/3", nil); st != http.StatusForbidden {
+			failRule(t, rule, "店员删除期望 403，实际 %d", st)
+		}
+		if st, _ := e.do("", http.MethodDelete, "/api/v1/stations/3", nil); st != http.StatusUnauthorized {
+			failRule(t, rule, "未登录删除期望 401，实际 %d", st)
+		}
+	})
+
+	t.Run("有待处理报修的机位拒绝删除", func(t *testing.T) {
+		const rule = "R12 HTTP 待处理报修机位不能删除"
+		if st, _ := e.do("staff", http.MethodPost, "/api/v1/stations/1/repair-report", map[string]string{"reason": "待处理"}); st != http.StatusOK {
+			t.Fatalf("[测试基建] 登记失败: %d", st)
+		}
+		st, b := e.do("admin", http.MethodDelete, "/api/v1/stations/1", nil)
+		if st != http.StatusConflict || b.Code != constants.CodeRepairExists {
+			failRule(t, rule, "期望 409/%d，实际 %d/%d %s", constants.CodeRepairExists, st, b.Code, b.Msg)
+		}
+		// 机位与报修均保留，详情仍可访问（无孤儿）
+		if st, _ := e.do("staff", http.MethodGet, "/api/v1/stations/1/detail", nil); st != http.StatusOK {
+			failRule(t, rule, "机位被拒删后详情应仍可访问，实际 %d", st)
+		}
+		_, b = e.do("admin", http.MethodGet, "/api/v1/repairs?status=pending&page=1&page_size=100", nil)
+		var page struct {
+			Total int64 `json:"total"`
+		}
+		_ = json.Unmarshal(b.Data, &page)
+		if page.Total != 1 {
+			failRule(t, rule, "待处理记录应保留 1 条: total=%d", page.Total)
+		}
+	})
+
+	t.Run("有已关闭报修的机位拒绝删除", func(t *testing.T) {
+		const rule = "R12 HTTP 已关闭报修机位不能删除"
+		if st, _ := e.do("staff", http.MethodPost, "/api/v1/stations/4/repair-close", map[string]string{"handle_result": "遗留修复"}); st != http.StatusOK {
+			// 4 号机位是 fault 无单遗留故障，补录恢复后留下 1 条已关闭记录
+			t.Fatalf("[测试基建] 遗留补录恢复失败: %d", st)
+		}
+		st, b := e.do("admin", http.MethodDelete, "/api/v1/stations/4", nil)
+		if st != http.StatusConflict || b.Code != constants.CodeRepairExists {
+			failRule(t, rule, "期望 409/%d，实际 %d/%d %s", constants.CodeRepairExists, st, b.Code, b.Msg)
+		}
+		// 关键回归断言：已关闭记录不会成为管理页孤儿、详情不会 404
+		if st, b2 := e.do("member", http.MethodGet, "/api/v1/stations/4/detail", nil); st != http.StatusOK || b2.Code != constants.CodeOK {
+			failRule(t, rule, "有已关闭记录的机位详情应可访问，实际 %d/%d", st, b2.Code)
+		}
+		_, b = e.do("admin", http.MethodGet, "/api/v1/stations/4/repairs", nil)
+		var recs []model.RepairRecord
+		_ = json.Unmarshal(b.Data, &recs)
+		if len(recs) != 1 || recs[0].Status != constants.RepairClosed {
+			failRule(t, rule, "已关闭记录应仍归属该机位可查: %+v", recs)
+		}
+	})
+
+	t.Run("使用中机位删除被原忙碌规则拦截", func(t *testing.T) {
+		const rule = "R12 HTTP 使用中机位不能删除"
+		st, b := e.do("admin", http.MethodDelete, "/api/v1/stations/2", nil)
+		if st != http.StatusConflict || b.Code != constants.CodeStationBusy {
+			failRule(t, rule, "期望 409/%d，实际 %d/%d %s", constants.CodeStationBusy, st, b.Code, b.Msg)
+		}
+	})
+
+	t.Run("无报修记录机位可删除且不留孤儿", func(t *testing.T) {
+		const rule = "R12 HTTP 无记录机位移除保持可用"
+		// 3 号机位 reserved、无任何报修记录
+		st, b := e.do("admin", http.MethodDelete, "/api/v1/stations/3", nil)
+		if st != http.StatusOK || b.Code != constants.CodeOK {
+			failRule(t, rule, "无记录机位删除应成功，实际 %d/%d %s", st, b.Code, b.Msg)
+		}
+		if st, _ := e.do("staff", http.MethodGet, "/api/v1/stations/3/detail", nil); st != http.StatusNotFound {
+			failRule(t, rule, "删除后详情应为 404，实际 %d", st)
+		}
+		// 管理列表不出现属于已删机位的孤儿记录
+		_, b = e.do("admin", http.MethodGet, "/api/v1/repairs?page=1&page_size=100", nil)
+		var all struct {
+			List  []model.RepairRecord `json:"list"`
+			Total int64                `json:"total"`
+		}
+		_ = json.Unmarshal(b.Data, &all)
+		for _, r := range all.List {
+			if r.StationID == 3 {
+				failRule(t, rule, "已删机位不应残留任何报修记录: %+v", r)
+			}
+		}
+		// 重复删除幂等（不存在按成功返回）
+		if st, _ := e.do("admin", http.MethodDelete, "/api/v1/stations/3", nil); st != http.StatusOK {
+			failRule(t, rule, "重复删除应幂等 200，实际 %d", st)
 		}
 	})
 }

@@ -74,6 +74,7 @@ const CODE = {
   VALIDATION: 42200,
   REPAIR_OPEN: 40010,
   REPAIR_NONE: 40011,
+  REPAIR_EXISTS: 40012,
 }
 
 let db: DB
@@ -339,12 +340,17 @@ export const mockAdapter = async (config: any) => {
     return ok(st)
   }
 
-  // DELETE /stations/:id
+  // DELETE /stations/:id（存在任何报修记录——待处理或已关闭——都拒绝，避免孤儿记录）
   m = url.match(/^\/stations\/(\d+)$/)
   if (method === 'delete' && m) {
     if (!user) { done(401, CODE.UNAUTHORIZED); return fail(401, CODE.UNAUTHORIZED, '未登录') }
     if (role !== 'admin') { done(403, CODE.FORBIDDEN); return fail(403, CODE.FORBIDDEN, '没有操作权限') }
     const stationID = Number(m[1])
+    const count = db.repairs.filter((r) => r.station_id === stationID).length
+    if (count > 0) {
+      done(409, CODE.REPAIR_EXISTS)
+      return fail(409, CODE.REPAIR_EXISTS, `机位存在 ${count} 条报修记录（含已关闭历史），不能删除`)
+    }
     db.stations = db.stations.filter((s) => s.id !== stationID)
     done(200, CODE.OK)
     return ok(null)

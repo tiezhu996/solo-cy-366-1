@@ -118,12 +118,14 @@ func (s *StationService) Delete(id uint) error {
 	if station.Status == constants.StationUsing {
 		return util.NewAppError(constants.CodeStationBusy, "使用中的机位不能删除，请先下机")
 	}
-	open, err := s.repairRepo.FindOpenByStation(id)
+	// 存在任何报修记录（待处理或已关闭）都拒绝删除，避免管理页残留孤儿记录、详情 404。
+	repairCount, err := s.repairRepo.CountByStation(id)
 	if err != nil {
-		return fmt.Errorf("station delete find open repair: %w", err)
+		return fmt.Errorf("station delete count repairs: %w", err)
 	}
-	if open != nil {
-		return util.NewAppError(constants.CodeRepairOpen, "该机位存在待处理报修，请先处理并恢复空闲后再删除")
+	if repairCount > 0 {
+		return util.NewAppError(constants.CodeRepairExists,
+			fmt.Sprintf("机位存在 %d 条报修记录（含已关闭历史），不能删除（实体：repair_record）", repairCount))
 	}
 	if err := s.stationRepo.Delete(id); err != nil {
 		return fmt.Errorf("station delete: %w", err)

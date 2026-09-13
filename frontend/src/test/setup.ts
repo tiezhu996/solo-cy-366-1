@@ -51,6 +51,28 @@ if (!(Element.prototype as unknown as { animate?: unknown }).animate) {
   })
 }
 
+// jsdom 下 Vant 弹层/下拉（teleport + 过渡）在更新或卸载时，可能对已不属于
+// 当前父节点的锚点调用 insertBefore、或重复 removeChild，抛 NotFoundError
+// （真实浏览器对该清理顺序更宽容）。仅在这种“游离”情形做幂等兜底，不改变正常 DOM 行为。
+;(function guardTeleportDomOps() {
+  const proto = Node.prototype
+  const rawRemoveChild = proto.removeChild
+  proto.removeChild = function patchedRemoveChild<T extends Node>(child: T): T {
+    if (child && child.parentNode !== this) {
+      return child
+    }
+    return rawRemoveChild.call(this, child) as T
+  }
+  const rawInsertBefore = proto.insertBefore
+  proto.insertBefore = function patchedInsertBefore<T extends Node>(newNode: T, referenceNode: Node | null): T {
+    if (referenceNode && referenceNode.parentNode !== this) {
+      // 锚点已游离：等价于追加到末尾
+      return rawInsertBefore.call(this, newNode, null) as T
+    }
+    return rawInsertBefore.call(this, newNode, referenceNode) as T
+  }
+})()
+
 // 每个用例前清理会话痕迹并恢复假后端初始种子数据，保证可连续运行。
 beforeEach(() => {
   localStorage.clear()
@@ -58,8 +80,8 @@ beforeEach(() => {
   document.body.innerHTML = ''
 })
 
-// 每个用例后卸载页面，避免 teleport/popup 跨用例残留。
-afterEach(() => {
-  disposeMountedPages()
-  document.body.innerHTML = ''
+// 每个用例后由 Vue 正常卸载（含 teleport 到 body 的弹层），不再手动清空 body，
+// 避免 Vant 弹层过渡的异步 removeChild 撞上已清空的父节点产生 jsdom NotFoundError。
+afterEach(async () => {
+  await disposeMountedPages()
 })

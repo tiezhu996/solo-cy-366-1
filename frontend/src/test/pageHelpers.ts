@@ -8,15 +8,36 @@ import { mockDB } from './mockBackend'
 
 // 已挂载页面，由 setup.ts 在用例后统一卸载，避免 teleport/popup 跨用例残留。
 const mountedWrappers: VueWrapper<any>[] = []
-export function disposeMountedPages(): void {
+
+/**
+ * 移除游离在 body 的 Vant teleport 叠层（toast/popup/dialog 等）。
+ * 这些节点可能已不属于当前组件树，若不先移除，组件卸载时其内部过渡的
+ * removeChild 会在 jsdom 下报 NotFoundError（真实浏览器容忍该顺序）。
+ */
+function detachOrphanOverlays(root: Element): void {
+  const overlaySel = ['.van-toast', '.van-overlay', '.van-popup', '.van-dialog', '.van-action-sheet'].join(',')
+  document.body.querySelectorAll(overlaySel).forEach((node) => {
+    if (!root.contains(node) && node.parentNode) {
+      node.parentNode.removeChild(node)
+    }
+  })
+}
+
+export async function disposeMountedPages(): Promise<void> {
+  // 先排空在途请求与响应式更新，避免组件在卸载过程中触发更新/teleport 清理异常。
+  await flushPromises()
+  await nextTick()
   while (mountedWrappers.length) {
     const w = mountedWrappers.pop()
+    const root = w?.element as Element | undefined
+    if (root) detachOrphanOverlays(root)
     try {
       w?.unmount()
     } catch {
       /* 已随 body 清理 */
     }
   }
+  await nextTick()
 }
 
 export type Role = 'admin' | 'staff' | 'member'

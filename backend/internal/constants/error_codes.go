@@ -21,6 +21,7 @@ const (
 	CodeTournament   = 40009
 	CodeRepairOpen   = 40010
 	CodeRepairNone   = 40011
+	CodeRepairExists = 40012
 )
 
 // 错误码与默认文案映射。
@@ -44,4 +45,5 @@ var ErrorMessages = map[int]string{
 	CodeTournament:   "赛事状态不允许该操作",
 	CodeRepairOpen:   "该机位已有待处理报修记录，请勿重复登记",
 	CodeRepairNone:   "该机位没有待处理的报修记录，无法关闭报修",
+	CodeRepairExists: "该机位存在报修记录（含已关闭），不能删除",
 }

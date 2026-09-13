@@ -33,6 +33,8 @@ import (
 //  R11 故障但无待处理报修单的机位（历史遗留脏数据）不再卡死：
 //     填写处理结果后直接补录一条已关闭报修记录并恢复空闲；记录留存处理结果/角色/时间；
 //     空白结果仍拒绝；恢复后可正常重新登记
+//  R12 删除机位守卫：存在任何报修记录（待处理或已关闭）一律 CodeRepairExists 拒绝，
+//     避免管理页残留孤儿记录、详情 404；无报修记录的机位可正常删除
 //
 // 稳定性：每个用例使用独立 DSN 的内存 sqlite 库（mode=memory），无外部依赖、
 // 无端口、无随机数据，可连续反复运行；断言信息以「规则名」开头，失败即可指认被破坏的规则。
@@ -573,4 +575,101 @@ func TestRepairRulePlainStatusAPIBlocked(t *testing.T) {
 	if updated.Status != constants.StationIdle {
 		failRule(t, rule, "reserved->idle 后状态错误: got=%s", updated.Status)
 	}
+}
+
+// TestRepairRuleDeleteGuards R12：删除机位时按报修记录情况处理（待处理/已关闭/无记录）。
+func TestRepairRuleDeleteGuards(t *testing.T) {
+	t.Run("有待处理报修的机位拒绝删除", func(t *testing.T) {
+		const rule = "R12a 待处理报修未闭环不能删除机位"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationIdle)
+		if _, _, err := f.repairSvc.Report(ruleAdmin, st.ID, "待处理故障"); err != nil {
+			failRule(t, rule, "前置登记失败: %v", err)
+		}
+		err := f.stationSvc.Delete(st.ID)
+		if err == nil {
+			failRule(t, rule, "有待处理报修时删除机位必须被拒绝")
+		}
+		if code := appErrorCode(t, err, rule); code != constants.CodeRepairExists {
+			failRule(t, rule, "错误码应为 %d(CodeRepairExists): got=%d", constants.CodeRepairExists, code)
+		}
+		// 机位与报修记录均保留
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationFault)
+		if n := countPending(t, rule, f.db, st.ID); n != 1 {
+			failRule(t, rule, "待处理报修记录应保留: got=%d", n)
+		}
+	})
+
+	t.Run("仅有已关闭报修的机位也拒绝删除", func(t *testing.T) {
+		const rule = "R12b 已关闭报修历史不能删除机位"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationIdle)
+		if _, _, err := f.repairSvc.Report(ruleAdmin, st.ID, "历史故障"); err != nil {
+			failRule(t, rule, "前置登记失败: %v", err)
+		}
+		if _, _, _, err := f.repairSvc.Close(ruleStaff, st.ID, "已修复"); err != nil {
+			failRule(t, rule, "前置恢复失败: %v", err)
+		}
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle) // 机位已空闲
+		err := f.stationSvc.Delete(st.ID)
+		if err == nil {
+			failRule(t, rule, "存在已关闭报修记录时删除机位必须被拒绝（否则管理页残留孤儿记录）")
+		}
+		if code := appErrorCode(t, err, rule); code != constants.CodeRepairExists {
+			failRule(t, rule, "错误码应为 %d(CodeRepairExists): got=%d", constants.CodeRepairExists, code)
+		}
+		// 机位与已关闭记录均保留
+		assertStationStatus(t, rule, f.db, st.ID, constants.StationIdle)
+		var closedCount int64
+		f.db.Model(&model.RepairRecord{}).
+			Where("station_id = ? AND status = ?", st.ID, constants.RepairClosed).Count(&closedCount)
+		if closedCount != 1 {
+			failRule(t, rule, "已关闭报修记录应保留: got=%d", closedCount)
+		}
+	})
+
+	t.Run("遗留补录记录同样拒绝删除", func(t *testing.T) {
+		const rule = "R12c 遗留补录的已关闭记录也不能删除机位"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationFault) // 故障无单
+		if _, _, _, err := f.repairSvc.Close(ruleAdmin, st.ID, "遗留补录修复"); err != nil {
+			failRule(t, rule, "前置补录恢复失败: %v", err)
+		}
+		if err := f.stationSvc.Delete(st.ID); err == nil {
+			failRule(t, rule, "存在遗留补录记录时删除机位必须被拒绝")
+		} else if appErrorCode(t, err, rule) != constants.CodeRepairExists {
+			failRule(t, rule, "错误码应为 %d: got=%d", constants.CodeRepairExists, appErrorCode(t, err, rule))
+		}
+	})
+
+	t.Run("无报修记录机位可正常删除", func(t *testing.T) {
+		const rule = "R12d 无报修记录机位移除保持可用"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationIdle)
+		if err := f.stationSvc.Delete(st.ID); err != nil {
+			failRule(t, rule, "无报修记录机位应可删除: %v", err)
+		}
+		var cnt int64
+		f.db.Model(&model.Station{}).Where("id = ?", st.ID).Count(&cnt)
+		if cnt != 0 {
+			failRule(t, rule, "机位应已从库中移除: cnt=%d", cnt)
+		}
+		// 删除不存在的机位保持幂等（不报错）
+		if err := f.stationSvc.Delete(st.ID); err != nil {
+			failRule(t, rule, "重复删除应幂等无错: %v", err)
+		}
+	})
+
+	t.Run("使用中机位删除仍被原有规则拦截", func(t *testing.T) {
+		const rule = "R12e 使用中机位删除规则不回归"
+		f := newRepairFixture(t)
+		st := f.seedStation(t, constants.StationUsing)
+		err := f.stationSvc.Delete(st.ID)
+		if err == nil {
+			failRule(t, rule, "使用中机位删除必须被拒绝")
+		}
+		if code := appErrorCode(t, err, rule); code != constants.CodeStationBusy {
+			failRule(t, rule, "错误码应为 %d(CodeStationBusy): got=%d", constants.CodeStationBusy, code)
+		}
+	})
 }

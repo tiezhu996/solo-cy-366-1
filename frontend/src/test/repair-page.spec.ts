@@ -32,7 +32,7 @@ vi.mock('vant', async (importOriginal) => {
 import Stations from '@/pages/Stations.vue'
 import Repairs from '@/pages/Repairs.vue'
 import { reportRepair, closeRepair, listRepairs } from '@/api/repair'
-import { updateStationStatus } from '@/api/station'
+import { updateStationStatus, deleteStation } from '@/api/station'
 import {
   mountPage, settle, loginAs, clickCellByText, clickPopupButton, findByText,
   textareaByPlaceholder, setNativeValue, dbState, type Role,
@@ -277,5 +277,59 @@ describe('P5 报修管理页 Repairs.vue（页面）', () => {
     pageMustContain('处理：管理员 admin', '处理角色与用户名')
     const anyTime = findByText(document.body, '.van-cell', FIRST_TIME)
     expect(anyTime, `【页面】管理页应可见时间（如 ${FIRST_TIME}）`).toBeTruthy()
+  })
+})
+
+describe('P6 移除机位的报修记录守卫（待处理/已关闭/无记录）', () => {
+  it('有待处理报修：删除返回 40012 且机位与记录均保留', async () => {
+    loginAs('admin')
+    await reportRepair(1, '待处理故障')
+    const code = await apiErrorCode(deleteStation(1))
+    expect(code, '【接口】有待处理报修删除应返回 40012').toBe(40012)
+    const state = dbState(1)
+    expect(state.station, '【接口】机位应保留').toBeTruthy()
+    expect(state.station?.status, '【接口】机位仍为 fault').toBe('fault')
+    expect(state.open?.status, '【接口】待处理报修应保留').toBe('pending')
+  })
+
+  it('有已关闭报修：删除返回 40012，详情与记录仍可访问（不产生孤儿）', async () => {
+    loginAs('admin')
+    await reportRepair(1, '已修复故障')
+    await closeRepair(1, '已处理完毕')
+    expect(await apiErrorCode(deleteStation(1)), '【接口】有已关闭记录删除应返回 40012').toBe(40012)
+    const state = dbState(1)
+    expect(state.station?.status, '【接口】机位应保留且空闲').toBe('idle')
+    expect(state.repairs.length, '【接口】已关闭记录应保留').toBe(1)
+    expect(state.repairs[0]?.status, '【接口】记录仍为 closed').toBe('closed')
+  })
+
+  it('仅有遗留补录记录：删除同样返回 40012', async () => {
+    loginAs('admin')
+    await closeRepair(4, '遗留处理后删除')
+    expect(await apiErrorCode(deleteStation(4)), '【接口】遗留补录记录也应阻止删除').toBe(40012)
+    expect(dbState(4).repairs.length, '【接口】补录记录应保留').toBe(1)
+  })
+
+  it('无报修记录：删除成功，列表与详情均不可再访问', async () => {
+    loginAs('admin')
+    // 3 号机位 reserved 且无任何报修记录
+    expect(await apiErrorCode(deleteStation(3)), '【接口】无记录机位删除应成功').toBe(0)
+    const state = dbState(3)
+    expect(state.station, '【接口】机位应已移除').toBeNull()
+    expect(state.repairs.length, '【接口】不应残留任何报修记录').toBe(0)
+    // 重复删除不存在机位按幂等成功（与后端一致）
+    expect(await apiErrorCode(deleteStation(3)), '【接口】重复删除应幂等成功').toBe(0)
+  })
+
+  it('会员删除机位返回 403；页面上管理员可见删除入口', async () => {
+    loginAs('member')
+    expect(await apiErrorCode(deleteStation(1)), '【接口】会员删除应返回 40300').toBe(40300)
+
+    // 页面入口：管理员在详情中可见删除机位按钮
+    loginAs('admin')
+    await mountPage(Stations)
+    await openStationDetail('A区-01')
+    const btn = findByText(document.body, 'button', '删除机位')
+    expect(btn, '【页面】管理员详情应可见删除机位入口').toBeTruthy()
   })
 })

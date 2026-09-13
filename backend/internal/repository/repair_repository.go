@@ -90,6 +90,13 @@ func (r *RepairRepository) List(page, pageSize int, stationID uint, status strin
 	return list, total, err
 }
 
+// CountByStation 统计机位的全部报修记录（含待处理与已关闭），删除机位前校验使用。
+func (r *RepairRepository) CountByStation(stationID uint) (int64, error) {
+	var n int64
+	err := r.db.Model(&model.RepairRecord{}).Where("station_id = ?", stationID).Count(&n).Error
+	return n, err
+}
+
 // findOpenByStation 查询待处理报修记录，内部复用（普通查询/行锁查询复用同一条件）。
 func (r *RepairRepository) findOpenByStation(q *gorm.DB, stationID uint) (*model.RepairRecord, error) {
 	var rec model.RepairRecord
