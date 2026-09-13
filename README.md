@@ -279,7 +279,10 @@ npm config set registry https://registry.npmmirror.com
 npm install
 npm run dev   # 开发服务器 http://localhost:28506，/api 代理到 29506
 npm run build
+npm test      # 报修页面可重复组件测试（Vitest + jsdom，无需后端服务）
 ```
+
+> 报修页面测试位于 `frontend/src/test/repair-page.spec.ts`：以内存假后端（与真实后端同业务规则/错误码）挂载真实页面，覆盖正常闭环、遗留故障补录恢复、会员只读、重复登记/非法状态拒绝与报修管理页；每个用例自动重置数据与会话，可连续反复运行。
 
 ## Docker 部署说明
 
